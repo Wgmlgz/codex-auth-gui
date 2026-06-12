@@ -1,0 +1,27 @@
+[package]
+name = "codex-auth-gui"
+version = "0.1.0"
+description = "Tauri GUI wrapper for the codex-auth CLI"
+authors = ["wgmlgz"]
+license = ""
+repository = ""
+edition = "2021"
+rust-version = "1.77.2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "codex_auth_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.2", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+regex = "1.12.2"
+shlex = "1.3.0"
+tauri = { version = "2.11.2", features = [] }
+tauri-plugin-log = "2"
