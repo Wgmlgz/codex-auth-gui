@@ -61,6 +61,7 @@ const importModeOptions: Array<{ label: string; value: ImportMode }> = [
   { label: 'Rebuild registry', value: 'purge' },
 ]
 const overviewRefreshIntervalMs = 30_000
+const cliPathStorageKey = 'codex-auth-gui:cli-path'
 
 const pages: Array<{
   id: PageId
@@ -91,12 +92,20 @@ function App() {
   const [threshold5h, setThreshold5h] = useState('')
   const [thresholdWeekly, setThresholdWeekly] = useState('')
   const [rawCommand, setRawCommand] = useState('codex-auth status')
+  const [cliPathOverride, setCliPathOverride] = useState(() => {
+    try {
+      return window.localStorage.getItem(cliPathStorageKey) ?? ''
+    } catch {
+      return ''
+    }
+  })
   const [commandLog, setCommandLog] = useState<CommandLogEntry[]>([])
   const [busyAction, setBusyAction] = useState<string | null>(null)
+  const cliOptions = { cliPath: cliPathOverride.trim() || undefined }
 
   const overviewQuery = useQuery({
-    queryKey: ['overview', refreshMode],
-    queryFn: () => getCliOverview(refreshMode),
+    queryKey: ['overview', refreshMode, cliOptions.cliPath ?? 'auto'],
+    queryFn: () => getCliOverview(refreshMode, cliOptions),
     refetchOnWindowFocus: false,
     refetchInterval: overviewRefreshIntervalMs,
     refetchIntervalInBackground: false,
@@ -220,6 +229,19 @@ function App() {
     return () => window.removeEventListener('hashchange', onHashChange)
   }, [])
 
+  useEffect(() => {
+    try {
+      const normalizedPath = cliPathOverride.trim()
+      if (normalizedPath) {
+        window.localStorage.setItem(cliPathStorageKey, normalizedPath)
+      } else {
+        window.localStorage.removeItem(cliPathStorageKey)
+      }
+    } catch {
+      // localStorage can be unavailable in restricted webviews.
+    }
+  }, [cliPathOverride])
+
   return (
     <main className="min-h-screen bg-[var(--background)] p-2.5 text-[var(--foreground)]">
       <div className="flex min-h-[calc(100vh-1.25rem)] w-full flex-col">
@@ -316,7 +338,11 @@ function App() {
                       void performCommand(
                         'remove-selected',
                         'Removing selected accounts',
-                        () => removeAccounts(actionableSelectedSelectors, { refreshMode }),
+                        () =>
+                          removeAccounts(actionableSelectedSelectors, {
+                            refreshMode,
+                            cliPath: cliOptions.cliPath,
+                          }),
                         { successMessage: 'Selected accounts removed.' },
                       )
                     }
@@ -350,7 +376,7 @@ function App() {
                         void performCommand(
                           `switch:${account.selector}`,
                           `Switching to ${account.label}`,
-                          () => switchAccount(account.selector, refreshMode),
+                          () => switchAccount(account.selector, refreshMode, cliOptions),
                           { successMessage: `Switched to ${account.label}.` },
                         )
                       }
@@ -377,7 +403,7 @@ function App() {
                     void performCommand(
                       'login',
                       'Starting browser login',
-                      () => startLogin(false),
+                      () => startLogin(false, cliOptions),
                       { successMessage: 'Browser login flow finished.' },
                     )
                   }
@@ -394,7 +420,7 @@ function App() {
                     void performCommand(
                       'device-login',
                       'Starting device auth login',
-                      () => startLogin(true),
+                      () => startLogin(true, cliOptions),
                       { successMessage: 'Device auth login flow finished.' },
                     )
                   }
@@ -443,7 +469,7 @@ function App() {
                         mode: importMode,
                         path: importPath.trim() || undefined,
                         alias: importMode === 'purge' ? undefined : importAlias.trim() || undefined,
-                      }),
+                      }, cliOptions),
                     { successMessage: 'Import completed.' },
                   )
                 }
@@ -461,6 +487,46 @@ function App() {
                 help="Control auto-switch, update threshold values, change API mode, and run codex-auth clean."
               />
 
+              <div className="space-y-1.5 rounded-lg border border-[var(--border)] px-3 py-2">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-sm font-medium">CLI path</p>
+                  <Badge variant={cliPathOverride.trim() ? 'default' : 'secondary'}>
+                    {cliPathOverride.trim() ? 'manual' : 'auto'}
+                  </Badge>
+                </div>
+                <Input
+                  className="h-8 text-xs"
+                  spellCheck={false}
+                  placeholder="Auto-detect codex-auth"
+                  value={cliPathOverride}
+                  onChange={(event) => setCliPathOverride(event.target.value)}
+                />
+                <p className="break-all text-[10px] leading-4 text-[var(--muted-foreground)]">
+                  Using {overviewQuery.data?.cliPath ?? cliOptions.cliPath ?? 'auto-detection'}
+                </p>
+                <div className="grid grid-cols-2 gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-8"
+                    disabled={overviewQuery.isFetching}
+                    onClick={() => void refreshOverview()}
+                  >
+                    <RefreshCw className={cn('size-4', overviewQuery.isFetching && 'animate-spin')} />
+                    Test
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-8"
+                    disabled={!cliPathOverride.trim()}
+                    onClick={() => setCliPathOverride('')}
+                  >
+                    Clear
+                  </Button>
+                </div>
+              </div>
+
               <div className="rounded-lg border border-[var(--border)] px-3 py-2">
                 <div className="flex items-center justify-between gap-3">
                   <div>
@@ -475,7 +541,7 @@ function App() {
                       void performCommand(
                         'toggle-auto-switch',
                         checked ? 'Enabling auto-switch' : 'Disabling auto-switch',
-                        () => setAutoSwitch(checked),
+                        () => setAutoSwitch(checked, cliOptions),
                         { successMessage: `Auto-switch ${checked ? 'enabled' : 'disabled'}.` },
                       )
                     }
@@ -513,6 +579,7 @@ function App() {
                       setAutoSwitchThresholds(
                         normalizedThreshold(threshold5h),
                         normalizedThreshold(thresholdWeekly),
+                        cliOptions,
                       ),
                     { successMessage: 'Thresholds updated.' },
                   )
@@ -534,7 +601,7 @@ function App() {
                     void performCommand(
                       'api-enable',
                       'Enabling API mode',
-                      () => setApiMode(true),
+                      () => setApiMode(true, cliOptions),
                       { successMessage: 'API mode enabled.' },
                     )
                   }
@@ -550,7 +617,7 @@ function App() {
                     void performCommand(
                       'api-disable',
                       'Disabling API mode',
-                      () => setApiMode(false),
+                      () => setApiMode(false, cliOptions),
                       { successMessage: 'Local-only mode enabled.' },
                     )
                   }
@@ -573,7 +640,7 @@ function App() {
                   void performCommand(
                     'clean',
                     'Cleaning stale account files',
-                    () => cleanAccounts(),
+                    () => cleanAccounts(cliOptions),
                     { successMessage: 'Cleanup completed.' },
                   )
                 }
@@ -606,7 +673,7 @@ function App() {
                     void performCommand(
                       'raw-command',
                       'Running raw command',
-                      () => runRawCommand(rawCommand),
+                      () => runRawCommand(rawCommand, cliOptions),
                       { refresh: true, successMessage: 'Raw command finished.' },
                     )
                   }

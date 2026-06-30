@@ -1,7 +1,8 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
-    env,
+    env, fs,
+    path::{Path, PathBuf},
     process::Command,
     sync::OnceLock,
 };
@@ -18,6 +19,7 @@ struct CliInvocation {
     program: String,
     prefix_args: Vec<String>,
     display_path: String,
+    path_env: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,18 +79,69 @@ struct ImportRequest {
     payload: Option<String>,
 }
 
-fn cli_invocation() -> Result<&'static CliInvocation, String> {
+fn cli_invocation(cli_path: Option<String>) -> Result<CliInvocation, String> {
+    if let Some(cli_path) = normalized_cli_path(cli_path) {
+        return discover_cli_invocation_for_path(&cli_path);
+    }
+
     CLI_INVOCATION
-        .get_or_init(discover_cli_invocation)
+        .get_or_init(|| {
+            if let Some(cli_path) = env::var("CODEX_AUTH_CLI")
+                .ok()
+                .and_then(|value| normalized_cli_path(Some(value)))
+            {
+                discover_cli_invocation_for_path(&cli_path)
+            } else {
+                discover_cli_invocation()
+            }
+        })
         .as_ref()
+        .cloned()
         .map_err(Clone::clone)
 }
 
-fn configure_hidden_process(command: &mut Command) {
+fn configure_hidden_process(_command: &mut Command) {
     #[cfg(target_os = "windows")]
     {
-        command.creation_flags(CREATE_NO_WINDOW);
+        _command.creation_flags(CREATE_NO_WINDOW);
     }
+}
+
+fn normalized_cli_path(cli_path: Option<String>) -> Option<String> {
+    cli_path
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn validate_cli_invocation(mut invocation: CliInvocation) -> Result<CliInvocation, String> {
+    let mut command = Command::new(&invocation.program);
+    configure_hidden_process(&mut command);
+    command.args(&invocation.prefix_args);
+    if let Some(path_env) = invocation.path_env.as_deref() {
+        command.env("PATH", path_env);
+    }
+    command.arg("--version");
+
+    let output = command.output().map_err(|error| {
+        format!(
+            "Failed to run codex-auth at {}: {error}",
+            invocation.display_path
+        )
+    })?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "Resolved codex-auth at {}, but it did not run successfully.\n\n{}",
+            invocation.display_path,
+            preferred_output_message(
+                &String::from_utf8_lossy(&output.stdout),
+                &String::from_utf8_lossy(&output.stderr),
+            )
+        ));
+    }
+
+    invocation.display_path = invocation.display_path.trim().to_string();
+    Ok(invocation)
 }
 
 fn discover_cli_invocation() -> Result<CliInvocation, String> {
@@ -122,7 +175,7 @@ fn discover_cli_invocation() -> Result<CliInvocation, String> {
         }
 
         if script_path.to_ascii_lowercase().ends_with(".ps1") {
-            return Ok(CliInvocation {
+            return validate_cli_invocation(CliInvocation {
                 program: "powershell".to_string(),
                 prefix_args: vec![
                     "-NoProfile".to_string(),
@@ -132,24 +185,222 @@ fn discover_cli_invocation() -> Result<CliInvocation, String> {
                     script_path.clone(),
                 ],
                 display_path: script_path,
+                path_env: None,
             });
         }
 
-        return Ok(CliInvocation {
+        return validate_cli_invocation(CliInvocation {
             program: script_path.clone(),
             prefix_args: Vec::new(),
             display_path: script_path,
+            path_env: None,
         });
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        Ok(CliInvocation {
-            program: "codex-auth".to_string(),
+        discover_unix_cli_invocation()
+    }
+}
+
+fn discover_cli_invocation_for_path(cli_path: &str) -> Result<CliInvocation, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let normalized_path = cli_path.to_string();
+        if normalized_path.to_ascii_lowercase().ends_with(".ps1") {
+            return validate_cli_invocation(CliInvocation {
+                program: "powershell".to_string(),
+                prefix_args: vec![
+                    "-NoProfile".to_string(),
+                    "-ExecutionPolicy".to_string(),
+                    "Bypass".to_string(),
+                    "-File".to_string(),
+                    normalized_path.clone(),
+                ],
+                display_path: normalized_path,
+                path_env: None,
+            });
+        }
+
+        validate_cli_invocation(CliInvocation {
+            program: normalized_path.clone(),
             prefix_args: Vec::new(),
-            display_path: "codex-auth".to_string(),
+            display_path: normalized_path,
+            path_env: None,
         })
     }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        unix_cli_invocation_for_candidate(cli_path, None)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn discover_unix_cli_invocation() -> Result<CliInvocation, String> {
+    if let Ok(invocation) = unix_cli_invocation_for_candidate("codex-auth", None) {
+        return Ok(invocation);
+    }
+
+    for shell_path in ["/bin/zsh", "/bin/bash", "/bin/sh"] {
+        if let Some((cli_path, path_env)) = resolve_cli_through_shell(shell_path) {
+            if let Ok(invocation) = unix_cli_invocation_for_candidate(&cli_path, Some(path_env)) {
+                return Ok(invocation);
+            }
+        }
+    }
+
+    for candidate in fallback_unix_cli_paths() {
+        if let Ok(invocation) =
+            unix_cli_invocation_for_candidate(&candidate.to_string_lossy(), None)
+        {
+            return Ok(invocation);
+        }
+    }
+
+    Err(format!(
+        "Could not resolve codex-auth. GUI apps on macOS do not inherit your terminal PATH.\n\nCurrent PATH: {}\n\nInstall @loongphy/codex-auth, then either launch from a shell that can run codex-auth or paste the full codex-auth path in Settings.",
+        env::var("PATH").unwrap_or_else(|_| "<unset>".to_string())
+    ))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resolve_cli_through_shell(shell_path: &str) -> Option<(String, String)> {
+    let output = Command::new(shell_path)
+        .args([
+            "-ilc",
+            "resolved=$(command -v codex-auth) && printf '__CODEX_AUTH_PATH__%s\\n__CODEX_AUTH_ENV__%s\\n' \"$resolved\" \"$PATH\"",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let cli_path = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("__CODEX_AUTH_PATH__"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let path_env = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("__CODEX_AUTH_ENV__"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    if cli_path.is_empty() {
+        None
+    } else {
+        Some((cli_path, path_env))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn fallback_unix_cli_paths() -> Vec<PathBuf> {
+    let mut candidates = vec![
+        PathBuf::from("/opt/homebrew/bin/codex-auth"),
+        PathBuf::from("/usr/local/bin/codex-auth"),
+        PathBuf::from("/usr/bin/codex-auth"),
+    ];
+
+    if let Some(home) = env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join(".npm-global/bin/codex-auth"));
+        candidates.push(home.join(".local/bin/codex-auth"));
+        candidates.push(home.join(".bun/bin/codex-auth"));
+
+        let nvm_versions = home.join(".nvm/versions/node");
+        if let Ok(entries) = fs::read_dir(nvm_versions) {
+            let mut nvm_candidates = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path().join("bin/codex-auth"))
+                .collect::<Vec<_>>();
+            nvm_candidates.sort();
+            nvm_candidates.reverse();
+            candidates.extend(nvm_candidates);
+        }
+    }
+
+    candidates
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unix_cli_invocation_for_candidate(
+    candidate: &str,
+    discovered_path_env: Option<String>,
+) -> Result<CliInvocation, String> {
+    let path_env = unix_path_env_for_candidate(candidate, discovered_path_env);
+
+    validate_cli_invocation(CliInvocation {
+        program: candidate.to_string(),
+        prefix_args: Vec::new(),
+        display_path: candidate.to_string(),
+        path_env,
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unix_path_env_for_candidate(
+    candidate: &str,
+    discovered_path_env: Option<String>,
+) -> Option<String> {
+    let mut path_parts = Vec::new();
+
+    if let Some(path_env) = discovered_path_env {
+        push_path_parts(&mut path_parts, &path_env);
+    }
+
+    if let Some(parent) = Path::new(candidate)
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        path_parts.push(parent.to_string_lossy().to_string());
+    }
+
+    push_path_parts(
+        &mut path_parts,
+        &env::var("PATH").unwrap_or_else(|_| {
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string()
+        }),
+    );
+
+    for fallback in [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ] {
+        path_parts.push(fallback.to_string());
+    }
+
+    let mut unique_parts = Vec::new();
+    for part in path_parts {
+        if !part.is_empty() && !unique_parts.contains(&part) {
+            unique_parts.push(part);
+        }
+    }
+
+    if unique_parts.is_empty() {
+        None
+    } else {
+        Some(unique_parts.join(":"))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn push_path_parts(parts: &mut Vec<String>, path_env: &str) {
+    parts.extend(
+        env::split_paths(path_env)
+            .map(|path| path.to_string_lossy().to_string())
+            .filter(|path| !path.is_empty()),
+    );
 }
 
 fn preferred_output_message(stdout: &str, stderr: &str) -> String {
@@ -166,10 +417,16 @@ fn preferred_output_message(stdout: &str, stderr: &str) -> String {
     "No output was produced.".to_string()
 }
 
-fn execute_codex_auth(args: &[String]) -> Result<CliCommandResult, String> {
-    let invocation = cli_invocation()?;
+fn execute_codex_auth(
+    args: &[String],
+    cli_path: Option<String>,
+) -> Result<CliCommandResult, String> {
+    let invocation = cli_invocation(cli_path)?;
     let mut command = Command::new(&invocation.program);
     configure_hidden_process(&mut command);
+    if let Some(path_env) = invocation.path_env.as_deref() {
+        command.env("PATH", path_env);
+    }
     command.args(&invocation.prefix_args);
     command.args(args);
 
@@ -216,7 +473,11 @@ fn parse_status_output(output: &str) -> CliStatusOverview {
     let mut usage_mode = "unknown".to_string();
     let mut account_mode = "unknown".to_string();
 
-    for line in output.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
         if let Some((key, value)) = line.split_once(':') {
             let normalized_key = key.trim().to_ascii_lowercase();
             let normalized_value = value.trim();
@@ -258,12 +519,14 @@ fn parse_status_output(output: &str) -> CliStatusOverview {
 fn parse_email(text: &str) -> Option<String> {
     let email_regex =
         Regex::new(r"(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}").expect("valid regex");
-    email_regex.find(text).map(|value| value.as_str().to_string())
+    email_regex
+        .find(text)
+        .map(|value| value.as_str().to_string())
 }
 
 fn parse_list_output(output: &str) -> Vec<CliAccountOverview> {
-    let row_regex = Regex::new(r"^(?P<active>\*)?\s*(?P<index>\d{2})\s+(?P<rest>.+)$")
-        .expect("valid regex");
+    let row_regex =
+        Regex::new(r"^(?P<active>\*)?\s*(?P<index>\d{2})\s+(?P<rest>.+)$").expect("valid regex");
     let split_regex = Regex::new(r"\s{2,}").expect("valid regex");
     let mut accounts = Vec::new();
 
@@ -382,28 +645,35 @@ where
 }
 
 #[tauri::command]
-async fn get_cli_overview(refresh_mode: Option<String>) -> Result<CliOverview, String> {
+async fn get_cli_overview(
+    refresh_mode: Option<String>,
+    cli_path: Option<String>,
+) -> Result<CliOverview, String> {
     run_blocking(move || {
+        let invocation = cli_invocation(cli_path.clone())?;
         let version_result = ensure_success(
             "Loading codex-auth version",
-            execute_codex_auth(&[String::from("--version")])?,
+            execute_codex_auth(&[String::from("--version")], cli_path.clone())?,
         )?;
         let help_result = ensure_success(
             "Loading codex-auth help",
-            execute_codex_auth(&[String::from("--help")])?,
+            execute_codex_auth(&[String::from("--help")], cli_path.clone())?,
         )?;
         let status_result = ensure_success(
             "Loading codex-auth status",
-            execute_codex_auth(&[String::from("status")])?,
+            execute_codex_auth(&[String::from("status")], cli_path.clone())?,
         )?;
 
         let mut list_args = vec![String::from("list")];
         push_refresh_mode(&mut list_args, refresh_mode);
-        let list_result = ensure_success("Loading codex-auth accounts", execute_codex_auth(&list_args)?)?;
+        let list_result = ensure_success(
+            "Loading codex-auth accounts",
+            execute_codex_auth(&list_args, cli_path.clone())?,
+        )?;
 
         Ok(CliOverview {
             version: version_result.stdout.trim().to_string(),
-            cli_path: cli_invocation()?.display_path.clone(),
+            cli_path: invocation.display_path,
             status: parse_status_output(&status_result.stdout),
             accounts: parse_list_output(&list_result.stdout),
             supported_commands: parse_supported_commands(&help_result.stdout),
@@ -418,6 +688,7 @@ async fn switch_account(
     account_id: Option<String>,
     query: Option<String>,
     refresh_mode: Option<String>,
+    cli_path: Option<String>,
 ) -> Result<CliCommandResult, String> {
     let selector = account_id
         .or(query)
@@ -429,7 +700,7 @@ async fn switch_account(
         let mut args = vec![String::from("switch")];
         push_refresh_mode(&mut args, refresh_mode);
         args.push(selector);
-        ensure_success("Switching accounts", execute_codex_auth(&args)?)
+        ensure_success("Switching accounts", execute_codex_auth(&args, cli_path)?)
     })
     .await
 }
@@ -440,6 +711,7 @@ async fn remove_accounts(
     queries: Option<Vec<String>>,
     all: Option<bool>,
     refresh_mode: Option<String>,
+    cli_path: Option<String>,
 ) -> Result<CliCommandResult, String> {
     let remove_all = all.unwrap_or(false);
     let selectors = account_ids
@@ -454,7 +726,10 @@ async fn remove_accounts(
         if remove_all {
             return ensure_success(
                 "Removing all accounts",
-                execute_codex_auth(&[String::from("remove"), String::from("--all")])?,
+                execute_codex_auth(
+                    &[String::from("remove"), String::from("--all")],
+                    cli_path.clone(),
+                )?,
             );
         }
 
@@ -469,7 +744,10 @@ async fn remove_accounts(
             let mut args = vec![String::from("remove")];
             push_refresh_mode(&mut args, refresh_mode.clone());
             args.push(selector);
-            let result = ensure_success("Removing account", execute_codex_auth(&args)?)?;
+            let result = ensure_success(
+                "Removing account",
+                execute_codex_auth(&args, cli_path.clone())?,
+            )?;
 
             if !result.stdout.trim().is_empty() {
                 stdout_chunks.push(result.stdout.trim().to_string());
@@ -492,20 +770,26 @@ async fn remove_accounts(
 }
 
 #[tauri::command]
-async fn start_login(device_auth: Option<bool>) -> Result<CliCommandResult, String> {
+async fn start_login(
+    device_auth: Option<bool>,
+    cli_path: Option<String>,
+) -> Result<CliCommandResult, String> {
     run_blocking(move || {
         let mut args = vec![String::from("login")];
         if device_auth.unwrap_or(false) {
             args.push(String::from("--device-auth"));
         }
 
-        ensure_success("Starting login flow", execute_codex_auth(&args)?)
+        ensure_success("Starting login flow", execute_codex_auth(&args, cli_path)?)
     })
     .await
 }
 
 #[tauri::command]
-async fn run_import(request: ImportRequest) -> Result<CliCommandResult, String> {
+async fn run_import(
+    request: ImportRequest,
+    cli_path: Option<String>,
+) -> Result<CliCommandResult, String> {
     run_blocking(move || {
         let mode = request
             .mode
@@ -550,13 +834,16 @@ async fn run_import(request: ImportRequest) -> Result<CliCommandResult, String> 
             args.push(alias);
         }
 
-        ensure_success("Running import", execute_codex_auth(&args)?)
+        ensure_success("Running import", execute_codex_auth(&args, cli_path)?)
     })
     .await
 }
 
 #[tauri::command]
-async fn set_auto_switch(enabled: bool) -> Result<CliCommandResult, String> {
+async fn set_auto_switch(
+    enabled: bool,
+    cli_path: Option<String>,
+) -> Result<CliCommandResult, String> {
     run_blocking(move || {
         let args = vec![
             String::from("config"),
@@ -564,7 +851,7 @@ async fn set_auto_switch(enabled: bool) -> Result<CliCommandResult, String> {
             if enabled { "enable" } else { "disable" }.to_string(),
         ];
 
-        ensure_success("Updating auto-switch", execute_codex_auth(&args)?)
+        ensure_success("Updating auto-switch", execute_codex_auth(&args, cli_path)?)
     })
     .await
 }
@@ -573,6 +860,7 @@ async fn set_auto_switch(enabled: bool) -> Result<CliCommandResult, String> {
 async fn set_auto_switch_thresholds(
     threshold_5h_percent: Option<u8>,
     threshold_weekly_percent: Option<u8>,
+    cli_path: Option<String>,
 ) -> Result<CliCommandResult, String> {
     run_blocking(move || {
         if threshold_5h_percent.is_none() && threshold_weekly_percent.is_none() {
@@ -591,13 +879,17 @@ async fn set_auto_switch_thresholds(
             args.push(value.to_string());
         }
 
-        ensure_success("Updating thresholds", execute_codex_auth(&args)?)
+        ensure_success("Updating thresholds", execute_codex_auth(&args, cli_path)?)
     })
     .await
 }
 
 #[tauri::command]
-async fn set_api_mode(enabled: Option<bool>, mode: Option<String>) -> Result<CliCommandResult, String> {
+async fn set_api_mode(
+    enabled: Option<bool>,
+    mode: Option<String>,
+    cli_path: Option<String>,
+) -> Result<CliCommandResult, String> {
     let resolved_enabled = enabled.or_else(|| match mode.as_deref().map(str::trim) {
         Some("api") => Some(true),
         Some("local") | Some("skip-api") | Some("chatgpt") => Some(false),
@@ -612,27 +904,35 @@ async fn set_api_mode(enabled: Option<bool>, mode: Option<String>) -> Result<Cli
         let args = vec![
             String::from("config"),
             String::from("api"),
-            if resolved_enabled { "enable" } else { "disable" }.to_string(),
+            if resolved_enabled {
+                "enable"
+            } else {
+                "disable"
+            }
+            .to_string(),
         ];
 
-        ensure_success("Updating API mode", execute_codex_auth(&args)?)
+        ensure_success("Updating API mode", execute_codex_auth(&args, cli_path)?)
     })
     .await
 }
 
 #[tauri::command]
-async fn clean_accounts() -> Result<CliCommandResult, String> {
+async fn clean_accounts(cli_path: Option<String>) -> Result<CliCommandResult, String> {
     run_blocking(move || {
         ensure_success(
             "Cleaning account files",
-            execute_codex_auth(&[String::from("clean")])?,
+            execute_codex_auth(&[String::from("clean")], cli_path)?,
         )
     })
     .await
 }
 
 #[tauri::command]
-async fn get_command_help(command: Option<String>) -> Result<CliCommandResult, String> {
+async fn get_command_help(
+    command: Option<String>,
+    cli_path: Option<String>,
+) -> Result<CliCommandResult, String> {
     run_blocking(move || {
         let args = if let Some(command) = command
             .map(|value| value.trim().to_string())
@@ -643,16 +943,19 @@ async fn get_command_help(command: Option<String>) -> Result<CliCommandResult, S
             vec![String::from("--help")]
         };
 
-        ensure_success("Loading command help", execute_codex_auth(&args)?)
+        ensure_success("Loading command help", execute_codex_auth(&args, cli_path)?)
     })
     .await
 }
 
 #[tauri::command]
-async fn run_raw_command(command: String) -> Result<CliCommandResult, String> {
+async fn run_raw_command(
+    command: String,
+    cli_path: Option<String>,
+) -> Result<CliCommandResult, String> {
     run_blocking(move || {
         let args = parse_raw_command(&command)?;
-        execute_codex_auth(&args)
+        execute_codex_auth(&args, cli_path)
     })
     .await
 }
