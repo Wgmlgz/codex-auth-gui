@@ -49,67 +49,106 @@ export type ImportRequest = {
   alias?: string
 }
 
-export async function getCliOverview(refreshMode: RefreshMode = 'default') {
+export type CliOptions = {
+  cliPath?: string
+}
+
+function normalizedCliPath(options?: CliOptions) {
+  const cliPath = options?.cliPath?.trim()
+  return cliPath || null
+}
+
+export async function getCliOverview(
+  refreshMode: RefreshMode = 'default',
+  options?: CliOptions,
+) {
   return invoke<CliOverview>('get_cli_overview', {
     refreshMode: refreshMode === 'default' ? null : refreshMode,
+    cliPath: normalizedCliPath(options),
   })
 }
 
-export async function switchAccount(selector: string, refreshMode: RefreshMode = 'default') {
+export async function switchAccount(
+  selector: string,
+  refreshMode: RefreshMode = 'default',
+  options?: CliOptions,
+) {
   return invoke<CliCommandResult>('switch_account', {
     accountId: selector,
     refreshMode: refreshMode === 'default' ? null : refreshMode,
+    cliPath: normalizedCliPath(options),
   })
 }
 
 export async function removeAccounts(
   selectors: string[],
-  options?: { all?: boolean; refreshMode?: RefreshMode },
+  options?: { all?: boolean; refreshMode?: RefreshMode; cliPath?: string },
 ) {
   return invoke<CliCommandResult>('remove_accounts', {
     accountIds: selectors,
     all: options?.all ?? false,
     refreshMode:
       (options?.refreshMode ?? 'default') === 'default' ? null : options?.refreshMode,
+    cliPath: normalizedCliPath(options),
   })
 }
 
-export async function startLogin(deviceAuth = false) {
-  return invoke<CliCommandResult>('start_login', { deviceAuth })
+export async function startLogin(deviceAuth = false, options?: CliOptions) {
+  return invoke<CliCommandResult>('start_login', {
+    deviceAuth,
+    cliPath: normalizedCliPath(options),
+  })
 }
 
-export async function runImport(request: ImportRequest) {
-  return invoke<CliCommandResult>('run_import', { request })
+export async function runImport(request: ImportRequest, options?: CliOptions) {
+  return invoke<CliCommandResult>('run_import', {
+    request,
+    cliPath: normalizedCliPath(options),
+  })
 }
 
-export async function setAutoSwitch(enabled: boolean) {
-  return invoke<CliCommandResult>('set_auto_switch', { enabled })
+export async function setAutoSwitch(enabled: boolean, options?: CliOptions) {
+  return invoke<CliCommandResult>('set_auto_switch', {
+    enabled,
+    cliPath: normalizedCliPath(options),
+  })
 }
 
 export async function setAutoSwitchThresholds(
   threshold5hPercent?: number,
   thresholdWeeklyPercent?: number,
+  options?: CliOptions,
 ) {
   return invoke<CliCommandResult>('set_auto_switch_thresholds', {
     threshold5hPercent: threshold5hPercent ?? null,
     thresholdWeeklyPercent: thresholdWeeklyPercent ?? null,
+    cliPath: normalizedCliPath(options),
   })
 }
 
-export async function setApiMode(enabled: boolean) {
-  return invoke<CliCommandResult>('set_api_mode', { enabled })
+export async function setApiMode(enabled: boolean, options?: CliOptions) {
+  return invoke<CliCommandResult>('set_api_mode', {
+    enabled,
+    cliPath: normalizedCliPath(options),
+  })
 }
 
-export async function cleanAccounts() {
-  return invoke<CliCommandResult>('clean_accounts')
+export async function cleanAccounts(options?: CliOptions) {
+  return invoke<CliCommandResult>('clean_accounts', {
+    cliPath: normalizedCliPath(options),
+  })
 }
 
-export async function getCommandHelp(command?: string) {
+export async function getCommandHelp(command?: string, options?: CliOptions) {
   return invoke<CliCommandResult>('get_command_help', {
     command: command?.trim() ? command.trim() : null,
+    cliPath: normalizedCliPath(options),
   })
 }
 
-export async function runRawCommand(command: string) {
-  return invoke<CliCommandResult>('run_raw_command', { command })
+export async function runRawCommand(command: string, options?: CliOptions) {
+  return invoke<CliCommandResult>('run_raw_command', {
+    command,
+    cliPath: normalizedCliPath(options),
+  })
 }
