@@ -1,6 +1,6 @@
 [package]
 name = "codex-auth-gui"
-version = "0.2.0"
+version = "0.3.0"
 description = "Tauri GUI wrapper for the codex-auth CLI"
 authors = ["wgmlgz"]
 license = ""

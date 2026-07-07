@@ -3,7 +3,6 @@ import {
   Bot,
   BrushCleaning,
   FolderInput,
-  Gauge,
   LogIn,
   RefreshCw,
   ShieldCheck,
@@ -20,7 +19,6 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
-import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import {
   cleanAccounts,
@@ -28,9 +26,6 @@ import {
   removeAccounts,
   runImport,
   runRawCommand,
-  setApiMode,
-  setAutoSwitch,
-  setAutoSwitchThresholds,
   startLogin,
   switchAccount,
   type CliAccountOverview,
@@ -89,9 +84,7 @@ function App() {
   const [importMode, setImportMode] = useState<ImportMode>('file')
   const [importPath, setImportPath] = useState('')
   const [importAlias, setImportAlias] = useState('')
-  const [threshold5h, setThreshold5h] = useState('')
-  const [thresholdWeekly, setThresholdWeekly] = useState('')
-  const [rawCommand, setRawCommand] = useState('codex-auth status')
+  const [rawCommand, setRawCommand] = useState('codex-auth list')
   const [cliPathOverride, setCliPathOverride] = useState(() => {
     try {
       return window.localStorage.getItem(cliPathStorageKey) ?? ''
@@ -168,13 +161,18 @@ function App() {
         await refreshOverview()
       }
 
-      toast.success(
-        options?.successMessage ??
-          preferredResultMessage(result, `${title} completed successfully.`),
-        { id: toastId },
-      )
+      const message =
+        result.ok && options?.successMessage
+          ? options.successMessage
+          : preferredResultMessage(result, `${title} completed successfully.`)
+
+      if (result.ok) {
+        toast.success(message, { id: toastId })
+      } else {
+        toast.error(message, { id: toastId })
+      }
     } catch (error) {
-      const message = error instanceof Error ? error.message : `${title} failed.`
+      const message = errorMessage(error, `${title} failed.`)
       toast.error(message, { id: toastId })
     } finally {
       setBusyAction(null)
@@ -198,16 +196,6 @@ function App() {
 
       return Array.from(new Set([...current, ...visibleSelectors]))
     })
-  }
-
-  function normalizedThreshold(value: string) {
-    const trimmed = value.trim()
-    if (!trimmed) {
-      return undefined
-    }
-
-    const parsed = Number.parseInt(trimmed, 10)
-    return Number.isNaN(parsed) ? undefined : parsed
   }
 
   const currentUsage5h = activeAccount?.usage5h ?? 'n/a'
@@ -289,7 +277,7 @@ function App() {
               ))}
             </Select>
             <span className="truncate text-[10px] text-[var(--muted-foreground)]">
-              Auto refresh {Math.round(overviewRefreshIntervalMs / 1000)}s · {busyAction ? busyAction : 'ready'}
+              Auto refresh {Math.round(overviewRefreshIntervalMs / 1000)}s / {busyAction ? busyAction : 'ready'}
             </span>
           </div>
         </header>
@@ -484,7 +472,7 @@ function App() {
             <div className="space-y-2">
               <SectionTitle
                 title="Settings"
-                help="Control auto-switch, update threshold values, change API mode, and run codex-auth clean."
+                help="Configure CLI detection, inspect codex-auth 0.3 status, choose refresh behavior, and run cleanup."
               />
 
               <div className="space-y-1.5 rounded-lg border border-[var(--border)] px-3 py-2">
@@ -527,109 +515,25 @@ function App() {
                 </div>
               </div>
 
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                <InfoChip label="Version" value={overviewQuery.data?.version ?? 'unknown'} />
+                <InfoChip label="Refresh" value={overviewQuery.data?.status.usageMode ?? 'unknown'} />
+                <InfoChip label="Active" value={overviewQuery.data?.status.accountMode ?? 'none'} />
+                <InfoChip label="Service" value={overviewQuery.data?.status.serviceStatus ?? 'unknown'} />
+              </div>
+
               <div className="rounded-lg border border-[var(--border)] px-3 py-2">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <p className="text-sm font-medium">Auto-switch</p>
-                    <p className="text-[11px] text-[var(--muted-foreground)]">
-                      {overviewQuery.data?.status.autoSwitchLabel ?? 'Unknown'}
-                    </p>
-                  </div>
-                  <Switch
-                    checked={overviewQuery.data?.status.autoSwitchEnabled ?? false}
-                    onCheckedChange={(checked) =>
-                      void performCommand(
-                        'toggle-auto-switch',
-                        checked ? 'Enabling auto-switch' : 'Disabling auto-switch',
-                        () => setAutoSwitch(checked, cliOptions),
-                        { successMessage: `Auto-switch ${checked ? 'enabled' : 'disabled'}.` },
-                      )
-                    }
-                  />
+                <p className="text-sm font-medium">Commands</p>
+                <div className="mt-2 flex flex-wrap gap-1">
+                  {(overviewQuery.data?.supportedCommands ?? []).map((command) => (
+                    <Badge key={command} variant="secondary">
+                      {command}
+                    </Badge>
+                  ))}
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-2">
-                <Input
-                  className="h-8 text-xs"
-                  inputMode="numeric"
-                  placeholder="5h %"
-                  value={threshold5h}
-                  onChange={(event) => setThreshold5h(event.target.value)}
-                />
-                <Input
-                  className="h-8 text-xs"
-                  inputMode="numeric"
-                  placeholder="Weekly %"
-                  value={thresholdWeekly}
-                  onChange={(event) => setThresholdWeekly(event.target.value)}
-                />
-              </div>
-
-              <Button
-                size="sm"
-                variant="secondary"
-                className="h-8"
-                disabled={!!busyAction}
-                onClick={() =>
-                  void performCommand(
-                    'set-thresholds',
-                    'Updating auto-switch thresholds',
-                    () =>
-                      setAutoSwitchThresholds(
-                        normalizedThreshold(threshold5h),
-                        normalizedThreshold(thresholdWeekly),
-                        cliOptions,
-                      ),
-                    { successMessage: 'Thresholds updated.' },
-                  )
-                }
-              >
-                <Gauge className="size-4" />
-                Save thresholds
-              </Button>
-
               <Separator />
-
-              <div className="grid grid-cols-2 gap-2">
-                <Button
-                  size="sm"
-                  variant={overviewQuery.data?.status.usageMode === 'api' ? 'default' : 'outline'}
-                  className="h-8"
-                  disabled={!!busyAction}
-                  onClick={() =>
-                    void performCommand(
-                      'api-enable',
-                      'Enabling API mode',
-                      () => setApiMode(true, cliOptions),
-                      { successMessage: 'API mode enabled.' },
-                    )
-                  }
-                >
-                  API mode
-                </Button>
-                <Button
-                  size="sm"
-                  variant={overviewQuery.data?.status.usageMode !== 'api' ? 'default' : 'outline'}
-                  className="h-8"
-                  disabled={!!busyAction}
-                  onClick={() =>
-                    void performCommand(
-                      'api-disable',
-                      'Disabling API mode',
-                      () => setApiMode(false, cliOptions),
-                      { successMessage: 'Local-only mode enabled.' },
-                    )
-                  }
-                >
-                  Local mode
-                </Button>
-              </div>
-
-              <div className="grid grid-cols-2 gap-2 text-xs">
-                <InfoChip label="Usage" value={overviewQuery.data?.status.usageMode ?? 'unknown'} />
-                <InfoChip label="Service" value={overviewQuery.data?.status.serviceStatus ?? 'unknown'} />
-              </div>
 
               <Button
                 size="sm"
@@ -662,7 +566,7 @@ function App() {
                 className="min-h-20 text-xs"
                 value={rawCommand}
                 onChange={(event) => setRawCommand(event.target.value)}
-                placeholder="codex-auth status"
+                placeholder="codex-auth list"
               />
               <div className="flex gap-2">
                 <Button
@@ -862,6 +766,18 @@ function preferredResultMessage(result: CliCommandResult, fallback: string) {
   const stderr = result.stderr.trim()
   if (stderr) {
     return stderr.split('\n').at(-1) ?? fallback
+  }
+
+  return fallback
+}
+
+function errorMessage(error: unknown, fallback: string) {
+  if (typeof error === 'string' && error.trim()) {
+    return error.trim()
+  }
+
+  if (error instanceof Error && error.message.trim()) {
+    return error.message.trim()
   }
 
   return fallback

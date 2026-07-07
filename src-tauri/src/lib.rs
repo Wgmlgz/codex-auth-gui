@@ -1,11 +1,9 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-    process::Command,
-    sync::OnceLock,
-};
+use std::{env, path::Path, process::Command, sync::OnceLock};
+
+#[cfg(not(target_os = "windows"))]
+use std::{fs, path::PathBuf};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -147,54 +145,11 @@ fn validate_cli_invocation(mut invocation: CliInvocation) -> Result<CliInvocatio
 fn discover_cli_invocation() -> Result<CliInvocation, String> {
     #[cfg(target_os = "windows")]
     {
-        let mut command = Command::new("powershell");
-        configure_hidden_process(&mut command);
-        let output = command
-            .args([
-                "-NoProfile",
-                "-Command",
-                "(Get-Command codex-auth -ErrorAction Stop).Source",
-            ])
-            .output()
-            .map_err(|error| format!("Failed to locate codex-auth through PowerShell: {error}"))?;
-
-        if !output.status.success() {
-            return Err(format!(
-                "Could not resolve codex-auth. {}",
-                preferred_output_message(
-                    &String::from_utf8_lossy(&output.stdout),
-                    &String::from_utf8_lossy(&output.stderr),
-                )
-            ));
+        if let Some(invocation) = resolve_windows_cli_through_powershell()? {
+            return validate_cli_invocation(invocation);
         }
 
-        let script_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-        if script_path.is_empty() {
-            return Err("PowerShell resolved an empty codex-auth path.".to_string());
-        }
-
-        if script_path.to_ascii_lowercase().ends_with(".ps1") {
-            return validate_cli_invocation(CliInvocation {
-                program: "powershell".to_string(),
-                prefix_args: vec![
-                    "-NoProfile".to_string(),
-                    "-ExecutionPolicy".to_string(),
-                    "Bypass".to_string(),
-                    "-File".to_string(),
-                    script_path.clone(),
-                ],
-                display_path: script_path,
-                path_env: None,
-            });
-        }
-
-        return validate_cli_invocation(CliInvocation {
-            program: script_path.clone(),
-            prefix_args: Vec::new(),
-            display_path: script_path,
-            path_env: None,
-        });
+        Err("Could not resolve codex-auth. Install @loongphy/codex-auth, then restart the app or paste the full codex-auth path in Settings.".to_string())
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -203,31 +158,152 @@ fn discover_cli_invocation() -> Result<CliInvocation, String> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn resolve_windows_cli_through_powershell() -> Result<Option<CliInvocation>, String> {
+    let resolver_script = r#"
+$pathValues = @(
+  [Environment]::GetEnvironmentVariable('Path', 'Process'),
+  [Environment]::GetEnvironmentVariable('Path', 'User'),
+  [Environment]::GetEnvironmentVariable('Path', 'Machine')
+)
+
+$directPaths = @(
+  [Environment]::GetEnvironmentVariable('NVM_SYMLINK', 'Process'),
+  [Environment]::GetEnvironmentVariable('NVM_SYMLINK', 'User'),
+  [Environment]::GetEnvironmentVariable('NVM_SYMLINK', 'Machine'),
+  [Environment]::GetEnvironmentVariable('APPDATA', 'Process') + '\npm',
+  [Environment]::GetEnvironmentVariable('APPDATA', 'User') + '\npm',
+  [Environment]::GetEnvironmentVariable('LOCALAPPDATA', 'Process') + '\Microsoft\WinGet\Links',
+  [Environment]::GetEnvironmentVariable('LOCALAPPDATA', 'User') + '\Microsoft\WinGet\Links',
+  'C:\nvm4w\nodejs',
+  'C:\Program Files\nodejs',
+  'C:\Program Files (x86)\nodejs'
+)
+
+$parts = New-Object System.Collections.Generic.List[string]
+foreach ($value in $pathValues) {
+  if ([string]::IsNullOrWhiteSpace($value)) { continue }
+  foreach ($part in $value -split ';') {
+    if ([string]::IsNullOrWhiteSpace($part)) { continue }
+    $expanded = [Environment]::ExpandEnvironmentVariables($part.Trim())
+    if (-not [string]::IsNullOrWhiteSpace($expanded)) { $parts.Add($expanded) }
+  }
+}
+
+foreach ($path in $directPaths) {
+  if ([string]::IsNullOrWhiteSpace($path)) { continue }
+  $expanded = [Environment]::ExpandEnvironmentVariables($path.Trim())
+  if (-not [string]::IsNullOrWhiteSpace($expanded)) { $parts.Add($expanded) }
+}
+
+$unique = New-Object System.Collections.Generic.List[string]
+foreach ($part in $parts) {
+  if ($unique -notcontains $part) { $unique.Add($part) }
+}
+
+$env:Path = $unique -join ';'
+$resolved = (Get-Command codex-auth -ErrorAction Stop).Source
+"__CODEX_AUTH_PATH__$resolved"
+"__CODEX_AUTH_ENV__$env:Path"
+"#;
+
+    let mut command = Command::new("powershell");
+    configure_hidden_process(&mut command);
+    let output = command
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            resolver_script,
+        ])
+        .output()
+        .map_err(|error| format!("Failed to locate codex-auth through PowerShell: {error}"))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let script_path = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("__CODEX_AUTH_PATH__"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let path_env = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("__CODEX_AUTH_ENV__"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    if script_path.is_empty() {
+        return Err(format!(
+            "PowerShell resolved an empty codex-auth path. {}",
+            preferred_output_message(
+                &String::from_utf8_lossy(&output.stdout),
+                &String::from_utf8_lossy(&output.stderr),
+            )
+        ));
+    }
+
+    let path_env = if path_env.is_empty() {
+        None
+    } else {
+        Some(path_env)
+    };
+
+    Ok(Some(windows_cli_invocation_for_resolved_path(
+        &script_path,
+        path_env,
+    )))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_cli_invocation_for_resolved_path(
+    cli_path: &str,
+    path_env: Option<String>,
+) -> CliInvocation {
+    let normalized_path = cli_path.to_string();
+    let lower_path = normalized_path.to_ascii_lowercase();
+
+    if lower_path.ends_with(".ps1") {
+        return CliInvocation {
+            program: "powershell".to_string(),
+            prefix_args: vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                normalized_path.clone(),
+            ],
+            display_path: normalized_path,
+            path_env,
+        };
+    }
+
+    if lower_path.ends_with(".cmd") || lower_path.ends_with(".bat") {
+        return CliInvocation {
+            program: "cmd".to_string(),
+            prefix_args: vec!["/C".to_string(), normalized_path.clone()],
+            display_path: normalized_path,
+            path_env,
+        };
+    }
+
+    CliInvocation {
+        program: normalized_path.clone(),
+        prefix_args: Vec::new(),
+        display_path: normalized_path,
+        path_env,
+    }
+}
+
 fn discover_cli_invocation_for_path(cli_path: &str) -> Result<CliInvocation, String> {
     #[cfg(target_os = "windows")]
     {
-        let normalized_path = cli_path.to_string();
-        if normalized_path.to_ascii_lowercase().ends_with(".ps1") {
-            return validate_cli_invocation(CliInvocation {
-                program: "powershell".to_string(),
-                prefix_args: vec![
-                    "-NoProfile".to_string(),
-                    "-ExecutionPolicy".to_string(),
-                    "Bypass".to_string(),
-                    "-File".to_string(),
-                    normalized_path.clone(),
-                ],
-                display_path: normalized_path,
-                path_env: None,
-            });
-        }
-
-        validate_cli_invocation(CliInvocation {
-            program: normalized_path.clone(),
-            prefix_args: Vec::new(),
-            display_path: normalized_path,
-            path_env: None,
-        })
+        validate_cli_invocation(windows_cli_invocation_for_resolved_path(cli_path, None))
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -605,7 +681,15 @@ fn parse_supported_commands(help_output: &str) -> Vec<String> {
             break;
         }
 
-        let token = trimmed.split_whitespace().next().unwrap_or_default();
+        if !line.starts_with("  ") || line.starts_with("    ") {
+            continue;
+        }
+
+        let token = trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(',');
         if !token.is_empty() {
             commands.push(token.to_string());
         }
@@ -614,24 +698,66 @@ fn parse_supported_commands(help_output: &str) -> Vec<String> {
     commands
 }
 
+fn refresh_mode_label(refresh_mode: Option<&str>) -> String {
+    match refresh_mode.map(str::trim) {
+        Some("skip-api") | Some("--skip-api") | Some("local") => "local".to_string(),
+        Some("api") | Some("--api") => "api".to_string(),
+        _ => "api".to_string(),
+    }
+}
+
+fn status_overview_from_list(list_output: &str, refresh_mode: Option<&str>) -> CliStatusOverview {
+    let active_account = parse_list_output(list_output)
+        .into_iter()
+        .find(|account| account.is_active);
+    let account_mode = active_account
+        .as_ref()
+        .map(|account| account.label.clone())
+        .unwrap_or_else(|| "none".to_string());
+
+    CliStatusOverview {
+        auto_switch_enabled: false,
+        auto_switch_label: "Not supported by codex-auth 0.3".to_string(),
+        service_status: "ready".to_string(),
+        threshold_5h_percent: None,
+        threshold_weekly_percent: None,
+        usage_mode: refresh_mode_label(refresh_mode),
+        account_mode,
+        raw_status: list_output.trim().to_string(),
+    }
+}
+
+fn is_codex_auth_executable(token: &str) -> bool {
+    let normalized = token.trim_matches('"').trim_matches('\'');
+    let Some(file_name) = Path::new(normalized).file_name() else {
+        return false;
+    };
+
+    let file_name = file_name.to_string_lossy().to_ascii_lowercase();
+    matches!(
+        file_name.as_str(),
+        "codex-auth" | "codex-auth.exe" | "codex-auth.cmd" | "codex-auth.bat" | "codex-auth.ps1"
+    )
+}
+
 fn parse_raw_command(command: &str) -> Result<Vec<String>, String> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return Err("Enter a codex-auth command or arguments first.".to_string());
     }
 
-    let args_text = trimmed
-        .strip_prefix("codex-auth")
-        .map(str::trim)
-        .unwrap_or(trimmed);
+    let mut args = shlex::split(trimmed).ok_or_else(|| {
+        "Unable to parse the command. Quote file paths or aliases that contain spaces.".to_string()
+    })?;
 
-    if args_text.is_empty() {
-        return Ok(Vec::new());
+    if args
+        .first()
+        .is_some_and(|token| is_codex_auth_executable(token))
+    {
+        args.remove(0);
     }
 
-    shlex::split(args_text).ok_or_else(|| {
-        "Unable to parse the command. Quote file paths or aliases that contain spaces.".to_string()
-    })
+    Ok(args)
 }
 
 async fn run_blocking<T, F>(work: F) -> Result<T, String>
@@ -659,24 +785,30 @@ async fn get_cli_overview(
             "Loading codex-auth help",
             execute_codex_auth(&[String::from("--help")], cli_path.clone())?,
         )?;
-        let status_result = ensure_success(
-            "Loading codex-auth status",
-            execute_codex_auth(&[String::from("status")], cli_path.clone())?,
-        )?;
+        let supported_commands = parse_supported_commands(&help_result.stdout);
 
         let mut list_args = vec![String::from("list")];
-        push_refresh_mode(&mut list_args, refresh_mode);
+        push_refresh_mode(&mut list_args, refresh_mode.clone());
         let list_result = ensure_success(
             "Loading codex-auth accounts",
             execute_codex_auth(&list_args, cli_path.clone())?,
         )?;
+        let status = if supported_commands.iter().any(|command| command == "status") {
+            let status_result = ensure_success(
+                "Loading codex-auth status",
+                execute_codex_auth(&[String::from("status")], cli_path.clone())?,
+            )?;
+            parse_status_output(&status_result.stdout)
+        } else {
+            status_overview_from_list(&list_result.stdout, refresh_mode.as_deref())
+        };
 
         Ok(CliOverview {
             version: version_result.stdout.trim().to_string(),
             cli_path: invocation.display_path,
-            status: parse_status_output(&status_result.stdout),
+            status,
             accounts: parse_list_output(&list_result.stdout),
-            supported_commands: parse_supported_commands(&help_result.stdout),
+            supported_commands,
             raw_help: help_result.stdout,
         })
     })
@@ -987,7 +1119,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_list_output, parse_raw_command, parse_status_output};
+    use super::{
+        parse_list_output, parse_raw_command, parse_status_output, parse_supported_commands,
+        status_overview_from_list,
+    };
 
     #[test]
     fn parses_status_output() {
@@ -1020,6 +1155,38 @@ mod tests {
     }
 
     #[test]
+    fn parses_v3_supported_commands() {
+        let parsed = parse_supported_commands(
+            "codex-auth 0.3.0-alpha.10\n\nCommands:\n  --help, -h\n      Show this help\n  list [--live] [--active] [--api|--skip-api]\n      List available accounts\n  config\n      Manage configuration\n\nNotes:\n  Run help.\n",
+        );
+
+        assert_eq!(
+            parsed,
+            vec![
+                "--help".to_string(),
+                "list".to_string(),
+                "config".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn derives_v3_status_from_list_output() {
+        let parsed = status_overview_from_list(
+            "     ACCOUNT                    PLAN  5H           WEEKLY       LAST ACTIVITY\n\
+-----------------------------------------------------------------------------\n\
+  01 first@example.com          Plus  100%         100%         9d ago\n\
+* 02 active@example.com         Plus  36% (20:32)  35% (18:19)  Now\n",
+            Some("skip-api"),
+        );
+
+        assert_eq!(parsed.service_status, "ready");
+        assert_eq!(parsed.usage_mode, "local");
+        assert_eq!(parsed.account_mode, "active@example.com");
+        assert_eq!(parsed.raw_status.lines().count(), 4);
+    }
+
+    #[test]
     fn parses_raw_arguments() {
         let parsed = parse_raw_command(r#"codex-auth import "C:\My Files\auth.json" --alias work"#)
             .expect("command should parse");
@@ -1033,5 +1200,24 @@ mod tests {
                 "work".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn parses_raw_arguments_without_stripping_similar_command_names() {
+        let parsed =
+            parse_raw_command("codex-authentication status").expect("command should parse");
+
+        assert_eq!(
+            parsed,
+            vec!["codex-authentication".to_string(), "status".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_raw_arguments_with_windows_shim_name() {
+        let parsed =
+            parse_raw_command(r#"codex-auth.ps1 list --skip-api"#).expect("command should parse");
+
+        assert_eq!(parsed, vec!["list".to_string(), "--skip-api".to_string(),]);
     }
 }
