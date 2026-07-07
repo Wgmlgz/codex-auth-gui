@@ -1,6 +1,6 @@
 # Codex Auth GUI
 
-## !!! Fully AI-Generated in 4 prompts !!!
+## !!! Fully AI-Generated in 5 prompts !!!
 
 Compact Tauri desktop wrapper for [`codex-auth`](https://github.com/Loongphy/codex-auth).
 
