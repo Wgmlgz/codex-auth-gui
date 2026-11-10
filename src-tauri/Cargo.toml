@@ -1,6 +1,6 @@
 [package]
 name = "codex-auth-gui"
-version = "0.3.0"
+version = "0.3.1"
 description = "Tauri GUI wrapper for the codex-auth CLI"
 authors = ["wgmlgz"]
 license = ""
@@ -25,3 +25,5 @@ regex = "1.12.2"
 shlex = "1.3.0"
 tauri = { version = "2.11.2", features = [] }
 tauri-plugin-log = "2"
+sysinfo = "0.33"
+open = "5"

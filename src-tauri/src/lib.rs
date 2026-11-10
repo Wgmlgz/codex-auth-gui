@@ -1,6 +1,13 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::{env, path::Path, process::Command, sync::OnceLock};
+use std::{
+    collections::HashSet,
+    env,
+    path::Path,
+    process::Command,
+    sync::{Mutex, OnceLock},
+};
+use sysinfo::{Pid, Process, ProcessesToUpdate, System};
 
 #[cfg(not(target_os = "windows"))]
 use std::{fs, path::PathBuf};
@@ -9,6 +16,7 @@ use std::{fs, path::PathBuf};
 use std::os::windows::process::CommandExt;
 
 static CLI_INVOCATION: OnceLock<Result<CliInvocation, String>> = OnceLock::new();
+static LAST_CODEX_GUI_EXECUTABLE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -528,6 +536,298 @@ fn ensure_success(context: &str, result: CliCommandResult) -> Result<CliCommandR
             preferred_output_message(&result.stdout, &result.stderr)
         ))
     }
+}
+
+fn is_codex_gui_process(process: &Process) -> bool {
+    let name = process.name().to_string_lossy().to_ascii_lowercase();
+    let path = process
+        .exe()
+        .map(|path| path.to_string_lossy().to_ascii_lowercase());
+    is_codex_gui_process_name_and_path(&name, path.as_deref())
+}
+
+fn is_codex_gui_process_name_and_path(name: &str, path: Option<&str>) -> bool {
+    let name = name.to_ascii_lowercase();
+    #[cfg(not(target_os = "windows"))]
+    let _ = path;
+    #[cfg(target_os = "windows")]
+    {
+        path.is_some_and(|path| path.contains("\\openai.codex_") && path.contains("\\app\\"))
+            || (name == "codex.exe" && path.is_some_and(|path| path.contains("\\codex\\codex.exe")))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        name == "codex" || name.starts_with("codex helper")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        name == "codex-desktop" || name == "codex-gui" || name.starts_with("codex helper")
+    }
+}
+
+fn codex_gui_processes(system: &System) -> Vec<Pid> {
+    let mut selected: Vec<Pid> = system
+        .processes()
+        .iter()
+        .filter_map(|(pid, process)| is_codex_gui_process(process).then_some(*pid))
+        .collect();
+    loop {
+        let before = selected.len();
+        for (pid, process) in system.processes() {
+            if process
+                .parent()
+                .is_some_and(|parent| selected.contains(&parent))
+                && !selected.contains(pid)
+            {
+                selected.push(*pid);
+            }
+        }
+        if selected.len() == before {
+            break;
+        }
+    }
+    selected
+}
+
+fn running_codex_gui_executable(system: &System) -> Option<std::path::PathBuf> {
+    system
+        .processes()
+        .values()
+        .find(|process| {
+            let name = process.name().to_string_lossy().to_ascii_lowercase();
+            #[cfg(target_os = "windows")]
+            {
+                name == "chatgpt.exe" && is_codex_gui_process(process)
+                    || name == "codex.exe" && is_codex_gui_process(process)
+            }
+            #[cfg(target_os = "macos")]
+            {
+                name == "codex"
+            }
+            #[cfg(target_os = "linux")]
+            {
+                name == "codex-desktop" || name == "codex-gui"
+            }
+        })
+        .and_then(|process| process.exe().map(Path::to_path_buf))
+}
+
+fn stop_codex_gui_processes() -> Result<Option<std::path::PathBuf>, String> {
+    let mut system = System::new_all();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    let executable = running_codex_gui_executable(&system);
+    if let Some(path) = &executable {
+        if let Ok(mut last) = LAST_CODEX_GUI_EXECUTABLE.lock() {
+            *last = Some(path.clone());
+        }
+    }
+    let mut empty_checks = 0;
+    let mut tracked = HashSet::new();
+    for _ in 0..50 {
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        tracked.extend(codex_gui_processes(&system));
+        tracked.retain(|pid| system.process(*pid).is_some());
+        if tracked.is_empty() {
+            empty_checks += 1;
+            if empty_checks >= 3 {
+                return Ok(executable);
+            }
+        } else {
+            empty_checks = 0;
+            for pid in &tracked {
+                if let Some(process) = system.process(*pid) {
+                    process.kill();
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Err("Codex GUI is still running after the stop request.".to_string())
+}
+
+fn confirm_active_account(selector: &str, cli_path: Option<String>) -> Result<(), String> {
+    for _ in 0..15 {
+        let result = ensure_success(
+            "Checking the active account",
+            execute_codex_auth(
+                &["list".to_string(), "--skip-api".to_string()],
+                cli_path.clone(),
+            )?,
+        )?;
+        if parse_list_output(&result.stdout)
+            .iter()
+            .any(|account| account.is_active && account.selector.eq_ignore_ascii_case(selector))
+        {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Err(format!(
+        "The account switch could not be confirmed for {selector}. Codex remains stopped."
+    ))
+}
+
+fn launch_codex_gui(executable: Option<std::path::PathBuf>) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        // Launch Services resolves the installed app even when its bundle moved.
+        if Command::new("open")
+            .args(["-a", "Codex"])
+            .status()
+            .is_ok_and(|status| status.success())
+            && wait_for_codex_gui_running()
+        {
+            return Ok(());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let store_install = executable.as_ref().is_some_and(|path| {
+            path.to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("\\windowsapps\\openai.codex_")
+        });
+        if store_install || executable.is_none() {
+            // Store packages must be activated by AppUserModelID, not by running ChatGPT.exe directly.
+            let launch = Command::new("explorer.exe")
+                .arg(r"shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App")
+                .spawn();
+            if launch.is_ok() && wait_for_codex_gui_running() {
+                return Ok(());
+            }
+        }
+    }
+
+    let mut remembered_error = None;
+    if let Some(path) = executable.filter(|path| path.is_file()) {
+        match Command::new(&path).spawn() {
+            Ok(_) if wait_for_codex_gui_running() => return Ok(()),
+            Ok(_) => {
+                remembered_error = Some(format!("Codex did not start from {}", path.display()))
+            }
+            Err(error) => {
+                remembered_error = Some(format!(
+                    "Could not launch Codex from {}: {error}",
+                    path.display()
+                ))
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let candidates = [
+            env::var_os("LOCALAPPDATA")
+                .map(|root| Path::new(&root).join("Programs/Codex/Codex.exe")),
+            env::var_os("PROGRAMFILES").map(|root| Path::new(&root).join("Codex/Codex.exe")),
+        ];
+        for path in candidates
+            .into_iter()
+            .flatten()
+            .filter(|path| path.is_file())
+        {
+            if Command::new(&path).spawn().is_ok() && wait_for_codex_gui_running() {
+                return Ok(());
+            }
+        }
+        if Command::new("Codex.exe").spawn().is_ok() && wait_for_codex_gui_running() {
+            return Ok(());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        for program in ["codex-desktop", "codex-gui"] {
+            if Command::new(program).spawn().is_ok() && wait_for_codex_gui_running() {
+                return Ok(());
+            }
+        }
+    }
+    Err(remembered_error.unwrap_or_else(|| "Could not locate Codex GUI. Start it once manually so this app can remember its executable path.".to_string()))
+}
+
+fn wait_for_codex_gui_running() -> bool {
+    let mut system = System::new_all();
+    for _ in 0..50 {
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        if system.processes().values().any(|process| {
+            let name = process.name().to_string_lossy().to_ascii_lowercase();
+            #[cfg(target_os = "windows")]
+            {
+                name == "chatgpt.exe" && is_codex_gui_process(process)
+                    || name == "codex.exe" && is_codex_gui_process(process)
+            }
+            #[cfg(target_os = "macos")]
+            {
+                name == "codex"
+            }
+            #[cfg(target_os = "linux")]
+            {
+                name == "codex-desktop" || name == "codex-gui"
+            }
+        }) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    false
+}
+
+#[tauri::command]
+async fn stop_codex_gui() -> Result<(), String> {
+    run_blocking(|| stop_codex_gui_processes().map(|_| ())).await
+}
+
+#[tauri::command]
+async fn start_codex_gui() -> Result<(), String> {
+    run_blocking(|| {
+        let mut system = System::new_all();
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        if !codex_gui_processes(&system).is_empty() {
+            return Ok(());
+        }
+        let executable = LAST_CODEX_GUI_EXECUTABLE
+            .lock()
+            .ok()
+            .and_then(|last| last.clone());
+        launch_codex_gui(executable)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn switch_account_and_relaunch(
+    account_id: String,
+    refresh_mode: Option<String>,
+    cli_path: Option<String>,
+) -> Result<CliCommandResult, String> {
+    let selector = account_id.trim().to_string();
+    if selector.is_empty() {
+        return Err("Pick an account before switching.".to_string());
+    }
+    run_blocking(move || {
+        // Resolve the CLI before closing Codex so a missing CLI leaves the app running.
+        cli_invocation(cli_path.clone())?;
+        let executable = stop_codex_gui_processes()?;
+        let mut args = vec![String::from("switch")];
+        push_refresh_mode(&mut args, refresh_mode);
+        args.push(selector);
+        let result = execute_codex_auth(&args, cli_path.clone())
+            .and_then(|result| ensure_success("Switching accounts", result))
+            .map_err(|error| format!("{error}\n\nCodex remains stopped."))?;
+        confirm_active_account(&args[args.len() - 1], cli_path)?;
+        // Do not start a new instance while an old tray or helper process remains.
+        stop_codex_gui_processes()?;
+        launch_codex_gui(executable).map_err(|error| format!("Account switched, but {error}"))?;
+        Ok(result)
+    })
+    .await
+}
+
+#[tauri::command]
+fn open_repository() -> Result<(), String> {
+    open::that("https://github.com/Wgmlgz/codex-auth-gui")
+        .map_err(|error| format!("Could not open GitHub: {error}"))
 }
 
 fn push_refresh_mode(args: &mut Vec<String>, refresh_mode: Option<String>) {
@@ -1099,6 +1399,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_cli_overview,
             switch_account,
+            switch_account_and_relaunch,
+            stop_codex_gui,
+            start_codex_gui,
+            open_repository,
             remove_accounts,
             start_login,
             run_import,
@@ -1120,9 +1424,35 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_list_output, parse_raw_command, parse_status_output, parse_supported_commands,
-        status_overview_from_list,
+        is_codex_gui_process_name_and_path, parse_list_output, parse_raw_command,
+        parse_status_output, parse_supported_commands, status_overview_from_list,
     };
+
+    #[test]
+    fn only_targets_codex_gui_processes() {
+        assert!(!is_codex_gui_process_name_and_path(
+            "codex-auth-gui.exe",
+            None
+        ));
+        assert!(!is_codex_gui_process_name_and_path("codex-auth.exe", None));
+        #[cfg(target_os = "windows")]
+        {
+            let app = r"c:\program files\windowsapps\openai.codex_1.0_x64__id\app\chatgpt.exe";
+            assert!(is_codex_gui_process_name_and_path("ChatGPT.exe", Some(app)));
+            assert!(!is_codex_gui_process_name_and_path(
+                "ChatGPT.exe",
+                Some(r"c:\program files\chatgpt\chatgpt.exe")
+            ));
+            assert!(!is_codex_gui_process_name_and_path(
+                "codex.exe",
+                Some(r"c:\tools\codex.exe")
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        assert!(is_codex_gui_process_name_and_path("Codex", None));
+        #[cfg(target_os = "linux")]
+        assert!(is_codex_gui_process_name_and_path("codex-desktop", None));
+    }
 
     #[test]
     fn parses_status_output() {

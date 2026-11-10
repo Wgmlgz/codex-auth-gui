@@ -4,6 +4,8 @@ import {
   BrushCleaning,
   FolderInput,
   LogIn,
+  Play,
+  Power,
   RefreshCw,
   ShieldCheck,
   TerminalSquare,
@@ -23,11 +25,15 @@ import { Textarea } from '@/components/ui/textarea'
 import {
   cleanAccounts,
   getCliOverview,
+  openRepository,
   removeAccounts,
   runImport,
   runRawCommand,
   startLogin,
+  startCodexGui,
+  stopCodexGui,
   switchAccount,
+  switchAccountAndRelaunch,
   type CliAccountOverview,
   type CliCommandResult,
   type ImportMode,
@@ -179,6 +185,19 @@ function App() {
     }
   }
 
+  async function performAppAction(actionKey: string, title: string, operation: () => Promise<void>) {
+    setBusyAction(actionKey)
+    const toastId = toast.loading(title)
+    try {
+      await operation()
+      toast.success(`${title} complete.`, { id: toastId })
+    } catch (error) {
+      toast.error(errorMessage(error, `${title} failed.`), { id: toastId })
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
   function toggleSelection(selector: string) {
     setSelectedSelectors((current) =>
       current.includes(selector)
@@ -243,18 +262,25 @@ function App() {
                 {activeAccount?.email ?? overviewQuery.data?.cliPath ?? 'Waiting for codex-auth'}
               </p>
             </div>
-            <Button
-              size="sm"
-              variant="outline"
-              className="h-8 px-2"
-              disabled={overviewQuery.isFetching || !!busyAction}
-              onClick={() => void refreshOverview()}
-            >
-              <RefreshCw className={cn('size-4', overviewQuery.isFetching && 'animate-spin')} />
-            </Button>
+            <div className="flex gap-1">
+              <Button size="sm" variant="outline" className="h-8 px-2" title="Open GitHub repository" aria-label="Open GitHub repository" onClick={() => void openRepository().catch((error) => toast.error(errorMessage(error, 'Could not open GitHub.')))}>
+                <GithubIcon />
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 px-2"
+                title="Refresh accounts"
+                aria-label="Refresh accounts"
+                disabled={overviewQuery.isFetching || !!busyAction}
+                onClick={() => void refreshOverview()}
+              >
+                <RefreshCw className={cn('size-4', overviewQuery.isFetching && 'animate-spin')} />
+              </Button>
+            </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-1.5">
+          <div className="grid grid-cols-3 gap-1.5">
             <MetricTile label="5h" value={currentUsage5h} wrapValue />
             <MetricTile label="Weekly" value={currentUsageWeekly} wrapValue />
             <MetricTile
@@ -262,6 +288,14 @@ function App() {
               value={overviewQuery.data?.status.usageMode ?? 'unknown'}
             />
             <MetricTile label="Accounts" value={String(accounts.length)} />
+            <Button size="sm" variant="outline" className="h-full min-h-12 flex-col gap-0.5 text-[10px]" disabled={!!busyAction} onClick={() => void performAppAction('stop-codex', 'Stopping Codex GUI', stopCodexGui)}>
+              <Power className="size-4" />
+              Stop Codex
+            </Button>
+            <Button size="sm" variant="outline" className="h-full min-h-12 flex-col gap-0.5 text-[10px]" disabled={!!busyAction} onClick={() => void performAppAction('start-codex', 'Launching Codex GUI', startCodexGui)}>
+              <Play className="size-4" />
+              Launch Codex
+            </Button>
           </div>
 
           <div className="flex items-center gap-2">
@@ -359,6 +393,8 @@ function App() {
                       account={account}
                       isSelected={actionableSelectedSelectors.includes(account.selector)}
                       isWorking={busyAction === `switch:${account.selector}`}
+                      isRelaunching={busyAction === `relaunch:${account.selector}`}
+                      isBusy={!!busyAction}
                       onSelect={() => toggleSelection(account.selector)}
                       onSwitch={() =>
                         void performCommand(
@@ -366,6 +402,14 @@ function App() {
                           `Switching to ${account.label}`,
                           () => switchAccount(account.selector, refreshMode, cliOptions),
                           { successMessage: `Switched to ${account.label}.` },
+                        )
+                      }
+                      onSwitchAndRelaunch={() =>
+                        void performCommand(
+                          `relaunch:${account.selector}`,
+                          `Switching to ${account.label} and relaunching Codex`,
+                          () => switchAccountAndRelaunch(account.selector, refreshMode, cliOptions),
+                          { successMessage: `Switched to ${account.label} and relaunched Codex.` },
                         )
                       }
                     />
@@ -635,6 +679,10 @@ function SectionTitle({ title, help }: { title: string; help: string }) {
   )
 }
 
+function GithubIcon() {
+  return <svg className="size-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .9a11.1 11.1 0 0 0-3.51 21.63c.56.1.76-.24.76-.54v-2.12c-3.1.67-3.75-1.31-3.75-1.31-.5-1.28-1.23-1.62-1.23-1.62-1.01-.69.08-.68.08-.68 1.12.08 1.71 1.15 1.71 1.15.99 1.7 2.6 1.21 3.23.93.1-.72.39-1.21.71-1.49-2.47-.28-5.07-1.24-5.07-5.49 0-1.21.43-2.2 1.14-2.98-.12-.28-.5-1.41.11-2.94 0 0 .93-.3 3.05 1.14a10.6 10.6 0 0 1 5.55 0c2.12-1.44 3.05-1.14 3.05-1.14.61 1.53.23 2.66.11 2.94.71.78 1.14 1.77 1.14 2.98 0 4.26-2.61 5.2-5.09 5.48.4.35.76 1.04.76 2.1v3.12c0 .3.2.65.77.54A11.1 11.1 0 0 0 12 .9Z" /></svg>
+}
+
 function HelpDot({ text }: { text: string }) {
   return (
     <div className="group relative">
@@ -697,14 +745,20 @@ function AccountItem({
   account,
   isSelected,
   isWorking,
+  isRelaunching,
+  isBusy,
   onSelect,
   onSwitch,
+  onSwitchAndRelaunch,
 }: {
   account: CliAccountOverview
   isSelected: boolean
   isWorking: boolean
+  isRelaunching: boolean
+  isBusy: boolean
   onSelect: () => void
   onSwitch: () => void
+  onSwitchAndRelaunch: () => void
 }) {
   return (
     <div
@@ -731,12 +785,12 @@ function AccountItem({
             <span>{account.lastActivity}</span>
           </div>
 
-          <div className="flex justify-end">
+          <div className="flex flex-wrap justify-end gap-1">
             <Button
               size="sm"
               variant={account.isActive ? 'outline' : 'default'}
               className="h-7 px-2"
-              disabled={account.isActive || isWorking}
+              disabled={account.isActive || isBusy}
               onClick={onSwitch}
             >
               {isWorking ? (
@@ -745,10 +799,21 @@ function AccountItem({
                   Wait
                 </>
               ) : account.isActive ? (
-                'Current'
+                <><ArrowRightLeft className="size-3.5" /> Current</>
               ) : (
-                'Switch'
+                <><ArrowRightLeft className="size-3.5" /> Switch</>
               )}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 px-2"
+              disabled={account.isActive || isBusy}
+              onClick={onSwitchAndRelaunch}
+              title="Stop Codex GUI and background processes, switch account, then relaunch"
+            >
+              {isRelaunching ? <RefreshCw className="size-3.5 animate-spin" /> : <Power className="size-3.5" />}
+              {isRelaunching ? 'Wait' : 'Switch + Relaunch'}
             </Button>
           </div>
         </div>

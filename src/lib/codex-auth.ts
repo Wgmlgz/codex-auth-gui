@@ -80,6 +80,30 @@ export async function switchAccount(
   })
 }
 
+export async function switchAccountAndRelaunch(
+  selector: string,
+  refreshMode: RefreshMode = 'default',
+  options?: CliOptions,
+) {
+  return invoke<CliCommandResult>('switch_account_and_relaunch', {
+    accountId: selector,
+    refreshMode: refreshMode === 'default' ? null : refreshMode,
+    cliPath: normalizedCliPath(options),
+  })
+}
+
+export async function stopCodexGui() {
+  return invoke<void>('stop_codex_gui')
+}
+
+export async function startCodexGui() {
+  return invoke<void>('start_codex_gui')
+}
+
+export async function openRepository() {
+  return invoke<void>('open_repository')
+}
+
 export async function removeAccounts(
   selectors: string[],
   options?: { all?: boolean; refreshMode?: RefreshMode; cliPath?: string },

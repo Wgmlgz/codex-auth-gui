@@ -15,6 +15,8 @@ The app does not manage auth files itself. It shells out to the installed `codex
 - Account inventory via `codex-auth list`
 - Status and usage mode via `codex-auth status`
 - Account switching via `codex-auth switch <query>`
+- Account switching with a full Codex GUI stop and relaunch
+- Codex GUI stop and launch controls (Windows, macOS, and Linux desktop)
 - Browser login and device auth login via `codex-auth login`
 - File, CPA, and purge imports via `codex-auth import ...`
 - Removal flows via `codex-auth remove ...`
